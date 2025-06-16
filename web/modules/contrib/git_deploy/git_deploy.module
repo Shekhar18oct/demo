@@ -1,0 +1,316 @@
+<?php
+
+/**
+ * @file
+ * Adds project, version and date information to projects checked out with Git.
+ */
+
+use Drupal\Core\Extension\Extension;
+
+/**
+ * Null device.
+ *
+ * If /dev/null does not exist, assume we are on Windows.
+ */
+define('GIT_DEPLOY_ERROR_DUMP', file_exists('/dev/null') ? '/dev/null' : 'nul');
+
+/**
+ * Implements hook_system_info_alter().
+ */
+function git_deploy_system_info_alter(array &$info, Extension $file, $type) {
+  // Use drupal_static() so we can free up memory from static variables later.
+  $projects = &drupal_static(__FUNCTION__ . ':projects', []);
+  $available = &drupal_static(__FUNCTION__ . ':available');
+  $update = &drupal_static(__FUNCTION__ . ':update', []);
+  // Core has hard-coded version numbers, so we need to verify them. Otherwise,
+  // a valid version number indicates that this project was not installed with
+  // Git.
+  if (empty($info['hidden']) && (empty($info['version']) || ($file->origin == 'core' ? strstr($info['version'], '-dev') == '-dev' : $info['version'] == \Drupal::VERSION || !preg_match('/^\d\..+\..+/', $info['version'])))) {
+    // Work around bug that causes Git to fail for users without home directory.
+    $home = getenv('HOME') === FALSE ? 'HOME=' . DRUPAL_ROOT . ' ' : '';
+    // Verify that we are in a Git repository. For core, also verify that this
+    // is really a Drupal repository.
+    $directory = exec($home . 'git -C ' . escapeshellarg($file->getPath()) . ' rev-parse --show-toplevel 2> ' . GIT_DEPLOY_ERROR_DUMP);
+    if (!empty($directory) && ($file->origin != 'core' || in_array($directory, [DRUPAL_ROOT, DRUPAL_ROOT . '/core']))) {
+      // Only check Git once per repository.
+      if (!isset($projects[$directory])) {
+        $projects[$directory] = [];
+        // Make sure Git operates in the right directory.
+        $git = $home . 'git -C ' . escapeshellarg($directory);
+        // Ensure file is in repository.
+        if (exec("$git ls-files " . escapeshellarg(str_replace("$directory/", '', realpath($file->getPathname()))) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP)) {
+          // Get upstream info.
+          $upstream = _git_deploy_get_upstream($git, $file->origin == 'core' ? ['8.*', '9.*', '10.*', '11.*'] : ['*.*']);
+          if ($file->origin == 'core') {
+            $project_name = 'drupal';
+          }
+          elseif (isset($upstream['remote'])) {
+            // Find the project name based on fetch URL.
+            $fetch_url = exec("$git config --get " . escapeshellarg("remote.$upstream[remote].url") . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+            if (!empty($fetch_url)) {
+              $project_name = basename($fetch_url, '.git');
+              $projects[$directory]['project'] = $project_name;
+            }
+          }
+          // Set project datestamp.
+          if (isset($upstream['datestamp'])) {
+            $projects[$directory]['datestamp'] = $upstream['datestamp'];
+            // The '_info_file_ctime' should always get the latest value.
+            if (empty($info['_info_file_ctime'])) {
+              $projects[$directory]['_info_file_ctime'] = $upstream['datestamp'];
+            }
+            else {
+              $projects[$directory]['_info_file_ctime'] = max($info['_info_file_ctime'], $upstream['datestamp']);
+            }
+          }
+          // Set version from tag.
+          if (isset($upstream['tag'])) {
+            $projects[$directory]['version'] = $upstream['tag'];
+          }
+          // If tag was not found, set version from branch.
+          elseif (isset($upstream['branch'])) {
+            if ($upstream['branch'] != 'master') {
+              $projects[$directory]['version'] = "$upstream[branch]-dev";
+            }
+            if (isset($project_name) && \Drupal::moduleHandler()->moduleExists('update') && ($upstream['synced'] || $upstream['branch'] == 'master')) {
+              if (!isset($available)) {
+                // We only get this from the cache because an update status
+                // query is supposed to done only after processing all enabled
+                // modules and themes.
+                $available = \Drupal::keyValueExpirable('update_available_releases')
+                  ->getAll();
+              }
+              if (!empty($available[$project_name]['releases'])) {
+                if ($upstream['branch'] == 'master') {
+                  // If there's available update_status data, we can use the
+                  // version string the release node pointing to HEAD really
+                  // has.
+                  foreach ($available[$project_name]['releases'] as $release) {
+                    if (isset($release['tag']) && $release['tag'] == 'HEAD') {
+                      $projects[$directory]['version'] = $release['version'];
+                      break;
+                    }
+                  }
+                }
+                if ($upstream['synced']) {
+                  // This project's datestamp needs to be synced with upstream
+                  // release.
+                  $version = $projects[$directory]['version'];
+                  if (!isset($available[$project_name]['releases'][$version]) || $projects[$directory]['_info_file_ctime'] > $available[$project_name]['last_fetch']) {
+                    // We need to update available release data for this
+                    // project.
+                    $update[$project_name] = $upstream['last_tag'];
+                  }
+                  else {
+                    $release = $available[$project_name]['releases'][$version];
+                    if ($available[$project_name]['releases'][$upstream['last_tag']]['date'] > $release['date']) {
+                      // Dev release is out of date, so use official release.
+                      $release = $available[$project_name]['releases'][$upstream['last_tag']];
+                    }
+                    _git_deploy_datestamp_sync($projects[$directory], $release);
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+      $info = $projects[$directory] + $info;
+    }
+  }
+}
+
+/**
+ * Gets upstream info.
+ *
+ * @param string $git
+ *   Git formatted for command line.
+ * @param string[] $patterns
+ *   List of patterns for matching branch names, without trailing ".x". Must not
+ *   include repository name. Also used to check for release tags.
+ *
+ * @return array
+ *   Array with the following keys, if found:
+ *   - branch: Best matching remote branch.
+ *   - remote: Remote repository containing best matching branch.
+ *   - synced: Whether local branch is up to date.
+ *   - tag: Release tag from last common commit in matching branch.
+ *   - last_tag: Last release tag if last common commit is not tagged.
+ *   - datestamp: Unix timestamp of last common commit.
+ */
+function _git_deploy_get_upstream($git, array $patterns = ['*']) {
+  $upstream = [
+    'last_tag' => '',
+    'synced' => FALSE,
+  ];
+  // Check that there are remote repositories.
+  exec("$git remote 2> " . GIT_DEPLOY_ERROR_DUMP, $remotes);
+  if (!empty($remotes)) {
+    // Get most recent tag.
+    $tag = exec("$git describe --tags --abbrev=0 --match " . implode(' --match ', substr_replace($patterns, '.*', array_map('strlen', $patterns))) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+    // Get current commit.
+    $last_base = $head = exec("$git log -1 --pretty=format:%H 2> " . GIT_DEPLOY_ERROR_DUMP);
+    // Get tracked upstream branch.
+    $remote = exec("$git rev-parse --abbrev-ref @{upstream} 2> " . GIT_DEPLOY_ERROR_DUMP);
+    if ($remote !== '' && preg_match('/^.+\/(?:' . implode('|', str_replace(['.', '*'], ['\.', '\d+'], $patterns)) . ')\.x$/', $remote)) {
+      // Set remote.
+      list($upstream['branch'], $upstream['remote']) = array_reverse(explode('/', $remote));
+      // Find last common commit in both local and upstream.
+      $last_base = exec("$git merge-base HEAD " . escapeshellarg($remote) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+      if (!empty($tag)) {
+        $upstream['last_tag'] = $tag;
+        // See if most recent tag is in our branch.
+        exec("$git describe --tags --contains " . escapeshellarg($last_base) . ' --match ' . escapeshellarg($tag) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP, $output, $status);
+      }
+      if (empty($tag) || $status !== 0) {
+        // Compare with last remote commit for update status.
+        $upstream['synced'] = $last_base == exec("$git log -1 --pretty=format:%H " . escapeshellarg($remote) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+      }
+      else {
+        $upstream['tag'] = $tag;
+      }
+    }
+    else {
+      // If local does not track an upstream branch, find best matching remote.
+      if (in_array('origin', $remotes)) {
+        // If origin exists, don't check any other remote repositories.
+        $upstream['remote'] = 'origin';
+      }
+      elseif ($remote !== '') {
+        // If we are tracking a remote repository, don't check any other remote
+        // repositories.
+        list(, $upstream['remote']) = array_reverse(explode('/', $remote));
+      }
+      if (isset($upstream['remote'])) {
+        $branch_patterns = substr_replace($patterns, "$upstream[remote]/", 0, 0);
+      }
+      else {
+        $upstream['remote'] = current($remotes);
+        $branch_patterns = substr_replace($patterns, '*/', 0, 0);
+      }
+      if (!empty($tag)) {
+        $upstream['last_tag'] = $tag;
+        // See if we are on a tag.
+        exec("$git describe --tags --exact-match --match " . escapeshellarg($tag) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP, $output, $status);
+      }
+      // If we are not on a tag, find the best matching remote branch.
+      if (empty($tag) || $status !== 0) {
+        // Append ".x" to the branch patterns.
+        $branch_patterns = substr_replace($branch_patterns, '.x', array_map('strlen', $branch_patterns));
+        // Enclose branch patterns in quotes and join together.
+        $branch_pattern = implode(' ', array_map('escapeshellarg', $branch_patterns));
+        // List matching branches by version in descending order.
+        exec("$git branch -r --list $branch_pattern master 2> " . GIT_DEPLOY_ERROR_DUMP, $branches);
+        if (!empty($branches)) {
+          usort($branches, 'version_compare');
+          foreach (array_reverse(array_map('trim', $branches)) as $branch) {
+            $tip = exec("$git log -1 --pretty=format:%H " . escapeshellarg($branch) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+            if ($tip == $head || $tip == exec("$git merge-base HEAD " . escapeshellarg($tip) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP)) {
+              // If local branch contains tip of remote branch, it is the best
+              // match.
+              list($upstream['branch'], $upstream['remote']) = array_reverse(explode('/', $branch));
+              $last_base = $tip;
+              // Local history contains last remote commit.
+              $upstream['synced'] = TRUE;
+              break;
+            }
+            if (isset($upstream['branch'])) {
+              // Replace branch tip with last common commit.
+              $tip = exec("$git merge-base HEAD " . escapeshellarg($tip) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+              if ($tip != $last_base) {
+                // See if this branch is older than last branch.
+                exec("$git merge-base --is-ancestor " . escapeshellarg($tip) . ' ' . escapeshellarg($last_base) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP, $output, $status);
+              }
+              if ($tip == $last_base || $status === 0) {
+                // Last remote branch was more recent. For performance, stop
+                // looking.
+                break;
+              }
+              // This remote branch is more recent.
+              list($upstream['branch'], $upstream['remote']) = array_reverse(explode('/', $branch));
+              $last_base = $tip;
+            }
+            else {
+              // Find most recent common commit.
+              list($upstream['branch'], $upstream['remote']) = array_reverse(explode('/', $branch));
+              $last_base = exec("$git merge-base HEAD " . escapeshellarg($tip) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP);
+              // Check for latest commit in local history.
+              $upstream['synced'] = $last_base == $tip;
+            }
+          }
+          if (!empty($tag)) {
+            // See if most recent tag is in our branch.
+            exec("$git describe --tags --contains " . escapeshellarg($last_base) . ' --match ' . escapeshellarg($tag) . ' 2> ' . GIT_DEPLOY_ERROR_DUMP, $output, $status);
+            if ($status === 0) {
+              $upstream['tag'] = $tag;
+            }
+          }
+        }
+      }
+      else {
+        $upstream['tag'] = $tag;
+      }
+    }
+    // Find the timestamp for the current commit.
+    $upstream['datestamp'] = exec("$git log -1 --pretty=format:%at " . escapeshellarg($last_base) . " 2> " . GIT_DEPLOY_ERROR_DUMP);
+  }
+  return $upstream;
+}
+
+/**
+ * Implements hook_update_projects_alter().
+ */
+function git_deploy_update_projects_alter(&$projects) {
+  // Get projects whose datestamps need to be synced with upstream releases.
+  $update = drupal_static('git_deploy_system_info_alter:update', []);
+  // Free up memory.
+  drupal_static_reset('git_deploy_system_info_alter:projects');
+  drupal_static_reset('git_deploy_system_info_alter:available');
+  drupal_static_reset('git_deploy_system_info_alter:update');
+  if (!empty($update)) {
+    // Fetch updated release data.
+    foreach ($update as $project_name => $last_tag) {
+      \Drupal::service('update.processor')
+        ->processFetchTask($projects[$project_name]);
+    }
+    $available = \Drupal::keyValueExpirable('update_available_releases')
+      ->getAll();
+    foreach ($update as $project_name => $last_tag) {
+      $project = &$projects[$project_name];
+      $version = $project['info']['version'];
+      $release = $available[$project_name]['releases'][$version];
+      if ($available[$project_name]['releases'][$last_tag]['date'] > $release['date']) {
+        // Dev release is out of date, so use official release.
+        $version = $last_tag;
+      }
+      if (isset($available[$project_name]['releases'][$version])) {
+        _git_deploy_datestamp_sync($project, $available[$project_name]['releases'][$version]);
+      }
+    }
+  }
+}
+
+/**
+ * Syncs the project datestamp to the release datestamp.
+ *
+ * @param array $project
+ *   Project data. Datestamp will be synced if up to date with release.
+ * @param array $release
+ *   Release data.
+ */
+function _git_deploy_datestamp_sync(array &$project, array $release) {
+  // Dev releases are packaged twice a day, so the dev release time could be up
+  // to twelve hours after the last push. Official releases are made within five
+  // minutes, so the official release time could be up to five minutes after the
+  // release is created.
+  $delay = $project['version'] == $release['version'] ? 43200 : 300;
+  // Add a 100-second buffer to account for packaging time.
+  if ((int) $project['datestamp'] + $delay + 100 > (int) $release['date']) {
+    // Dev releases are packaged twice a day, so it could be behind the branch
+    // tip. Use the latest of the release time or the last commit time.
+    $project['datestamp'] = max($release['date'], $project['datestamp']);
+  }
+  // @todo: We cannot know the actual delay in creating a package because it
+  // depends on when the maintainer creates a new release or pushes to an
+  // existing dev release.
+}

@@ -16,9 +16,11 @@
     ],
     "require": {
         "composer/installers": "^2.0",
+        "drupal/composer_deploy": "^1.10",
         "drupal/core-composer-scaffold": "10.0.0",
         "drupal/core-project-message": "10.0.0",
         "drupal/core-recommended": "10.0.0",
+        "drupal/git_deploy": "^2.6",
         "drupal/upgrade_status": "^4.3",
         "drush/drush": "^12.5"
     },

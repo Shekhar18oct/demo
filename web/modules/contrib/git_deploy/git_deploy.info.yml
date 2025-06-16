@@ -1,0 +1,9 @@
+name: 'Git Deploy'
+description: 'Helps sites that are deployed directly from Git repositories.'
+core_version_requirement: ^8 || ^9 || ^10 || ^11
+type: module
+
+# Information added by Drupal.org packaging script on 2024-07-09
+version: '8.x-2.6'
+project: 'git_deploy'
+datestamp: 1720518104

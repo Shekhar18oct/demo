@@ -1,0 +1,23 @@
+{#
+/**
+ * @file
+ * Overrides core/modules/update/templates/update-version.html.twig
+ *
+ * The default template does not provide a good entrypoint for
+ * adding the diff link to the existing markup. This is a workaorund
+ * to add the link without copying the default template.
+ */
+#}
+{% set default_template %}
+  {{ include("@update/update-version.html.twig") }}
+{% endset %}
+{% if version.diff_link %}
+  {% set diff_link %}
+    <li class="project-update__diff-link">
+      <a href="{{ version.diff_link }}">{{ 'Diff'|t }}</a>
+    </li>
+  {% endset %}
+  {{ composer_deploy_append(default_template, '.project-update__version-links', diff_link) }}
+{% else %}
+ {{ default_template }}
+{% endif %}

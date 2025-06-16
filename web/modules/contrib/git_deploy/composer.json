@@ -1,0 +1,6 @@
+{
+    "name": "drupal/git_deploy",
+    "description": "Gets version info from Git log.",
+    "type": "drupal-module",
+    "license": "GPL-2.0-or-later"
+}

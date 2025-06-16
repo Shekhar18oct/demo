@@ -1,0 +1,37 @@
+<?php
+
+/**
+ * @file
+ * Checks that site can get version information with Git.
+ */
+
+/**
+ * Implements hook_requirements().
+ */
+function git_deploy_requirements($phase) {
+  $requirements = [];
+  if (in_array($phase, ['install', 'runtime'])) {
+    $message = t('Available');
+    $severity = REQUIREMENT_OK;
+    $description = '';
+
+    if (!function_exists('exec')) {
+      $message = t('Disabled exec()');
+      $description = t('The exec() PHP function is disabled. Git Deploy is unable to work without that.');
+      $severity = REQUIREMENT_ERROR;
+    }
+    elseif (!exec('git')) {
+      $message = t('Git not found');
+      $description = t('The git binary is not executable from PHP. Git Deploy is unable to work without that.');
+      $severity = REQUIREMENT_ERROR;
+    }
+
+    $requirements['git_deploy'] = [
+      'title' => t('Executable git binary'),
+      'value' => $message,
+      'severity' => $severity,
+      'description' => $description,
+    ];
+  }
+  return $requirements;
+}
